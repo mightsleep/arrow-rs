@@ -50,11 +50,6 @@ use crate::bit_chunk_iterator::BitChunks;
 /// # use arrow_buffer::bit_util::compress;
 /// assert_eq!(compress(0b1011_0100, 0b0110_1101), 0b0000_1010);
 /// ```
-//
-// `value.compress(mask)` (`uint_gather_scatter_bits`, unstable:
-// <https://github.com/rust-lang/rust/issues/149069>) is the constant-time
-// parallel suffix network when portable, which `compress_portable` beats on
-// sparse and dense masks: measure before switching the fallback to it.
 #[inline]
 pub fn compress(value: u64, mask: u64) -> u64 {
     #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
@@ -72,11 +67,8 @@ pub fn compress(value: u64, mask: u64) -> u64 {
 
 /// [`compress`] for a caller that already has `count = mask.count_ones()`.
 ///
-/// Without `pext` the fallback branches on the count. A caller that counts
-/// ahead of use, such as a loop over many masks, can take that count off the
-/// path of the branch: where the count is a software popcount (x86-64
-/// without POPCNT), computing it right before the branch makes every
-/// mispredicted branch several cycles dearer.
+/// The fallback without `pext` branches on the count, so a loop over many
+/// masks can count ahead and keep the count off the branch's path.
 ///
 /// `count` must equal `mask.count_ones()`; otherwise the result is
 /// unspecified.
@@ -105,18 +97,15 @@ pub fn compress_with_count(value: u64, mask: u64, count: u32) -> u64 {
 
 /// [`compress`] without `pext`, by the number of kept bits `k`:
 ///
-/// * `k <= 2`: the two lowest kept bits, directly. A mask from independent
-///   rows gives each word a random `k`, and a loop over the kept bits then
-///   mispredicts its exit on nearly every word; this has no exit.
-/// * `k <= 16`: one step per kept bit. Cheapest when the branches are
-///   predictable, as on clustered or periodic rows.
-/// * `k >= 62`: a full word as it is, else the dropped bits removed,
-///   directly: the dense counterpart of the first case.
-/// * otherwise [`compress_bytes`], whose cost does not depend on `mask`.
+/// * `k <= 2`: the two lowest kept bits, tested directly
+/// * `k <= 16`: one step per kept bit
+/// * `k >= 62`: `value` with its at most two dropped bits removed
+/// * otherwise [`compress_bytes`]
+///
+/// The two ends need no loop, so no loop exit to mispredict when `k`
+/// varies from word to word.
 #[cfg_attr(all(target_arch = "x86_64", target_feature = "bmi2"), allow(dead_code))]
-// Always: `filter_bits_compress` calls it once a word, and left to itself
-// LLVM kept it out of line, a call a word that cost 20 to 60 % on sparse
-// filters.
+// Always: called once a word, so a call would cost more than a sparse word
 #[inline(always)]
 fn compress_portable(value: u64, mask: u64, kept: u32) -> u64 {
     if kept <= 2 {
@@ -139,14 +128,12 @@ fn compress_portable(value: u64, mask: u64, kept: u32) -> u64 {
         }
         result
     } else if kept >= 62 {
-        // Full words first, tested only here so that no other path pays:
-        // sorted or clustered data is mostly full and empty words
         if kept == 64 {
             return value;
         }
-        // Highest first, so that the lower dropped bits stay where they are;
-        // a step with nothing left to drop keeps every bit. Each step shifts
-        // a zero in at the top, so the bits above the kept ones end clear.
+        // Remove the highest dropped bit first, so the lower ones stay put.
+        // With nothing left to drop a step keeps every bit, and each step
+        // shifts a zero in at the top.
         let mut value = value;
         let mut dropped = !mask;
         for _ in 0..2 {
@@ -169,15 +156,14 @@ const fn bytes(b: u8) -> u64 {
     b as u64 * 0x0101_0101_0101_0101
 }
 
-/// [`compress`] in constant time: every byte compressed on its own, then the
-/// bytes put end to end.
+/// [`compress`] in constant time, a byte at a time and all bytes at once.
 ///
-/// The first half is the parallel suffix network (Hacker's Delight 7-4, in
-/// the form of `core`'s `extract_bits`) at eight bits: three rounds, run on
-/// all eight bytes at once, each shift masked so that no bit crosses into a
-/// neighbouring byte, as a `u8` would drop it. The second half moves each
-/// byte's kept bits above the kept bits of the bytes below it; one multiply
-/// gives all eight offsets.
+/// Within a byte each kept bit moves down by the number of dropped bits
+/// below it. Written in binary, that distance is at most 7, so three rounds
+/// move by 1, 2 and 4 the bits whose distance has that bit set (the parallel
+/// suffix network, Hacker's Delight 7-4); shifts are masked to stay within
+/// the byte. Byte `j` then lands at the sum of the kept counts of bytes
+/// `0..j`, all eight sums from one multiply by `0x0101..01`.
 #[cfg_attr(all(target_arch = "x86_64", target_feature = "bmi2"), allow(dead_code))]
 #[inline]
 fn compress_bytes(value: u64, mask: u64) -> u64 {

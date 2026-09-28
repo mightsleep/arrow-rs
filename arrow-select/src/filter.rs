@@ -818,14 +818,10 @@ fn filter_bits_compress(buffer: &BooleanBuffer, predicate: &FilterPredicate) -> 
             packer.push(value_chunks.chunk(index), mask);
         }
     } else {
-        // Without `pext` the fallback branches on each word's count, and a
-        // software popcount right before that branch made every
-        // misprediction about five cycles dearer. Counted one non-empty word
-        // ahead, the count is ready long before its branch runs. Only here:
-        // with a hardware count there is nothing to hide, and the lookahead
-        // costs 3 to 30 % on sparse masks
-        // Words with no kept bits are skipped before the corresponding values
-        // are read, so only the mask is touched for them
+        // The fallback branches on each word's count. Counted one non-empty
+        // word ahead, a software count is done before that branch, so a
+        // misprediction is not also waiting on it. With a hardware count
+        // there is nothing to wait on, and the lookahead only adds work
         let mut words = mask_chunks
             .iter()
             .enumerate()
