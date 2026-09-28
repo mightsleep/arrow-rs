@@ -758,9 +758,14 @@ fn filter_bits_compress(buffer: &BooleanBuffer, predicate: &FilterPredicate) -> 
     impl Packer {
         #[inline(always)]
         fn push(&mut self, values: u64, mask: u64) {
-            let bits = bit_util::compress(values, mask);
+            self.push_counted(values, mask, mask.count_ones())
+        }
+
+        #[inline(always)]
+        fn push_counted(&mut self, values: u64, mask: u64, kept: u32) {
+            let bits = bit_util::compress_with_count(values, mask, kept);
             self.current |= bits << self.filled;
-            let total = self.filled + mask.count_ones();
+            let total = self.filled + kept;
             if total < 64 {
                 self.filled = total;
             } else {
@@ -796,13 +801,43 @@ fn filter_bits_compress(buffer: &BooleanBuffer, predicate: &FilterPredicate) -> 
         filled: 0,
     };
 
-    for (index, mask) in mask_chunks.iter().enumerate() {
+    /// x86-64 with neither `pext` nor POPCNT, the default target
+    const SOFTWARE_POPCOUNT: bool = cfg!(all(
+        target_arch = "x86_64",
+        not(target_feature = "bmi2"),
+        not(target_feature = "popcnt")
+    ));
+
+    if !SOFTWARE_POPCOUNT {
+        for (index, mask) in mask_chunks.iter().enumerate() {
+            // Words with no kept bits are skipped before the corresponding
+            // values are read, so only the mask is touched for them
+            if mask == 0 {
+                continue;
+            }
+            packer.push(value_chunks.chunk(index), mask);
+        }
+    } else {
+        // Without `pext` the fallback branches on each word's count, and a
+        // software popcount right before that branch made every
+        // misprediction about five cycles dearer. Counted one non-empty word
+        // ahead, the count is ready long before its branch runs. Only here:
+        // with a hardware count there is nothing to hide, and the lookahead
+        // costs 3 to 30 % on sparse masks
         // Words with no kept bits are skipped before the corresponding values
         // are read, so only the mask is touched for them
-        if mask == 0 {
-            continue;
+        let mut words = mask_chunks
+            .iter()
+            .enumerate()
+            .filter(|&(_, mask)| mask != 0);
+        let mut next = words.next();
+        let mut next_kept = next.map_or(0, |(_, mask)| mask.count_ones());
+        while let Some((index, mask)) = next {
+            let kept = next_kept;
+            next = words.next();
+            next_kept = next.map_or(0, |(_, mask)| mask.count_ones());
+            packer.push_counted(value_chunks.chunk(index), mask, kept);
         }
-        packer.push(value_chunks.chunk(index), mask);
     }
     packer.push(value_chunks.remainder_bits(), mask_chunks.remainder_bits());
 

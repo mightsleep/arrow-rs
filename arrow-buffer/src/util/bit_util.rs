@@ -66,7 +66,40 @@ pub fn compress(value: u64, mask: u64) -> u64 {
 
     #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
     {
-        compress_portable(value, mask)
+        compress_portable(value, mask, mask.count_ones())
+    }
+}
+
+/// [`compress`] for a caller that already has `count = mask.count_ones()`.
+///
+/// Without `pext` the fallback branches on the count. A caller that counts
+/// ahead of use, such as a loop over many masks, can take that count off the
+/// path of the branch: where the count is a software popcount (x86-64
+/// without POPCNT), computing it right before the branch makes every
+/// mispredicted branch several cycles dearer.
+///
+/// `count` must equal `mask.count_ones()`; otherwise the result is
+/// unspecified.
+///
+/// ```
+/// # use arrow_buffer::bit_util::compress_with_count;
+/// let mask = 0b0110_1101_u64;
+/// assert_eq!(compress_with_count(0b1011_0100, mask, mask.count_ones()), 0b0000_1010);
+/// ```
+#[inline(always)]
+pub fn compress_with_count(value: u64, mask: u64, count: u32) -> u64 {
+    debug_assert_eq!(count, mask.count_ones());
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    {
+        let _ = count;
+        // SAFETY: the `bmi2` target feature is statically enabled for this
+        // build, so the `pext` instruction is guaranteed to be available.
+        unsafe { std::arch::x86_64::_pext_u64(value, mask) }
+    }
+
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    {
+        compress_portable(value, mask, count)
     }
 }
 
@@ -85,8 +118,7 @@ pub fn compress(value: u64, mask: u64) -> u64 {
 // LLVM kept it out of line, a call a word that cost 20 to 60 % on sparse
 // filters.
 #[inline(always)]
-fn compress_portable(value: u64, mask: u64) -> u64 {
-    let kept = mask.count_ones();
+fn compress_portable(value: u64, mask: u64, kept: u32) -> u64 {
     if kept <= 2 {
         let lowest = mask & mask.wrapping_neg();
         let second = mask ^ lowest;
@@ -1153,12 +1185,14 @@ mod tests {
         // `compress` to: uniform random masks alone have about 32 kept bits
         // and would only reach `compress_bytes`
         let check = |value: u64, mask: u64| {
+            let want = compress_reference(value, mask);
+            let kept = mask.count_ones();
             assert_eq!(
-                compress_portable(value, mask),
-                compress_reference(value, mask),
-                "value={value:#x} mask={mask:#x} kept={}",
-                mask.count_ones()
+                compress_portable(value, mask, kept),
+                want,
+                "value={value:#x} mask={mask:#x} kept={kept}"
             );
+            assert_eq!(compress_with_count(value, mask, kept), want);
         };
         let mut rng = StdRng::seed_from_u64(42);
 
