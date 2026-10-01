@@ -1,0 +1,130 @@
+# Not for upstream: times the `compress` fallback of upstream main against
+# the one of this branch, on machines the author does not have. Runs on push
+# to the `compress-bench` branch of a fork.
+#
+# Each variant is built once; the rounds only alternate the two executables.
+name: compress bench
+
+on:
+  push:
+    branches: [compress-bench]
+
+permissions: {}
+
+env:
+  # Short runs, three interleaved rounds: the spread between rounds shows the noise.
+  CRITERION_OPTS: --warm-up-time 0.3 --measurement-time 1 --noplot
+
+jobs:
+  bench:
+    name: ${{ matrix.job }} ${{ matrix.runner }} ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # `filter_bits`: the existing cases and the batches of #11271
+          - { job: filter_bits, runner: ubuntu-24.04-arm, target: default, rustflags: "" }
+          - { job: filter_bits, runner: macos-15, target: default, rustflags: "" }
+          - { job: filter_bits, runner: ubuntu-latest, target: default, rustflags: "" }
+          - { job: filter_bits, runner: ubuntu-latest, target: x86-64-v2, rustflags: "-C target-cpu=x86-64-v2" }
+          # The other callers: null masks of filtered nullable arrays (the
+          # compress path runs for kept 1/64 to 63/64) and the definition
+          # levels of nested parquet columns
+          - { job: downstream, runner: ubuntu-24.04-arm, target: default, rustflags: "" }
+          - { job: downstream, runner: ubuntu-latest, target: default, rustflags: "" }
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
+      # The executables run outside cargo, so pin where criterion keeps its baselines.
+      CRITERION_HOME: ${{ github.workspace }}/target/criterion
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - name: Machine
+        run: |
+          uname -a
+          (lscpu 2>/dev/null || sysctl -n machdep.cpu.brand_string hw.model) | head -20
+      - name: Build both variants once
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The fork's main may lag behind, so compare against upstream's.
+          git fetch --no-tags https://github.com/apache/arrow-rs.git main
+          base=$(git merge-base HEAD FETCH_HEAD)
+          echo "base: $(git log -1 --format='%h %s' "$base")"
+          file=arrow-buffer/src/util/bit_util.rs
+          if [ "${{ matrix.job }}" = filter_bits ]; then
+            benches=("arrow-select filter_bits")
+          else
+            benches=("arrow filter_kernels test_utils" "parquet arrow_reader arrow,test_common,experimental")
+          fi
+          build() {
+            local variant=$1
+            for spec in "${benches[@]}"; do
+              read -r pkg bench features <<< "$spec"
+              exe=$(cargo bench -p "$pkg" ${features:+--features "$features"} --bench "$bench" --no-run \
+                --message-format=json | jq -r "select(.target.name == \"$bench\" and .executable != null) | .executable")
+              cp "$exe" "bin-$variant-$bench"
+            done
+          }
+          build ours
+          git show "$base:$file" > "$file"
+          build main
+          git checkout HEAD -- "$file"
+          ls -la bin-*
+      - name: Run, interleaved three times
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.job }}" = filter_bits ]; then
+            runs=("filter_bits ^filter_bits")
+          else
+            runs=("filter_kernels w NULLs" "arrow_reader arrow_array_reader/(ListArray|struct)/")
+          fi
+          for i in 1 2 3; do
+            for variant in main ours; do
+              for spec in "${runs[@]}"; do
+                bench=${spec%% *}; filter=${spec#* }
+                # shellcheck disable=SC2086
+                "./bin-$variant-$bench" --bench $CRITERION_OPTS --save-baseline "$variant$i" "$filter"
+              done
+            done
+          done
+      - name: Ratios (main / ours, above 1 is faster)
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          {
+            echo "### ${{ matrix.job }} ${{ matrix.runner }} ${{ matrix.target }}"
+            echo
+            echo "| benchmark | round 1 | round 2 | round 3 |"
+            echo "|---|---|---|---|"
+            find target/criterion -path '*/main1/estimates.json' | sort | while read -r f; do
+              dir=$(dirname "$(dirname "$f")")
+              name=$(jq -r '.title // empty' "$dir/main1/benchmark.json" 2>/dev/null || true)
+              [ -n "$name" ] || name=$(basename "$dir")
+              row="| $name |"
+              for i in 1 2 3; do
+                m="$dir/main$i/estimates.json"; o="$dir/ours$i/estimates.json"
+                if [ -f "$m" ] && [ -f "$o" ]; then
+                  row="$row $(jq -rn --slurpfile m "$m" --slurpfile o "$o" '($m[0].median.point_estimate / $o[0].median.point_estimate) * 100 | round / 100') |"
+                else
+                  row="$row - |"
+                fi
+              done
+              echo "$row"
+            done
+          } | tee -a "$GITHUB_STEP_SUMMARY" ratios.md
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: compress-bench-${{ matrix.job }}-${{ matrix.runner }}-${{ matrix.target }}
+          path: |
+            ratios.md
+            target/criterion
