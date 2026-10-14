@@ -1,0 +1,108 @@
+# Not for upstream: times `zip` of upstream main against the one
+# of this branch, on machines the author does not have. Runs on push to the
+# `zip-bench` branch of a fork.
+#
+# Each variant is built once; the rounds only alternate the two executables.
+name: zip bench
+
+on:
+  push:
+    branches: [zip-bench]
+
+permissions: {}
+
+env:
+  # Short runs, three interleaved rounds: the spread between rounds shows the noise.
+  CRITERION_OPTS: --warm-up-time 0.3 --measurement-time 1 --noplot
+
+jobs:
+  bench:
+    name: ${{ matrix.runner }} ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04-arm, target: default, rustflags: "" }
+          - { runner: macos-15, target: default, rustflags: "" }
+          - { runner: ubuntu-latest, target: default, rustflags: "" }
+          # AVX2: whether the blend still wins when LLVM has wider vectors
+          - { runner: ubuntu-latest, target: x86-64-v3, rustflags: "-C target-cpu=x86-64-v3" }
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
+      # The executables run outside cargo, so pin where criterion keeps its baselines.
+      CRITERION_HOME: ${{ github.workspace }}/target/criterion
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - name: Machine
+        run: |
+          uname -a
+          (lscpu 2>/dev/null || sysctl -n machdep.cpu.brand_string hw.model) | head -20
+      - name: Build both variants once
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The fork's main may lag behind, so compare against upstream's.
+          git fetch --no-tags https://github.com/apache/arrow-rs.git main
+          base=$(git merge-base HEAD FETCH_HEAD)
+          echo "base: $(git log -1 --format='%h %s' "$base")"
+          file=arrow-select/src/zip.rs
+          build() {
+            exe=$(cargo bench -p arrow --features test_utils --bench zip_kernels --no-run \
+              --message-format=json | jq -r 'select(.target.name == "zip_kernels" and .executable != null) | .executable')
+            cp "$exe" "bin-$1"
+          }
+          build ours
+          git show "$base:$file" > "$file"
+          build main
+          git checkout HEAD -- "$file"
+          ls -la bin-*
+      - name: Run, interleaved three times
+        shell: bash
+        run: |
+          set -euo pipefail
+          for i in 1 2 3; do
+            for variant in main ours; do
+              # shellcheck disable=SC2086
+              "./bin-$variant" --bench $CRITERION_OPTS --save-baseline "$variant$i" zip_8192_from_i32/
+            done
+          done
+      - name: Ratios (main / ours, above 1 is faster)
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          {
+            echo "### ${{ matrix.runner }} ${{ matrix.target }}"
+            echo
+            echo "| benchmark | round 1 | round 2 | round 3 |"
+            echo "|---|---|---|---|"
+            find target/criterion -path '*/main1/estimates.json' | sort | while read -r f; do
+              dir=$(dirname "$(dirname "$f")")
+              name=$(jq -r '.title // empty' "$dir/main1/benchmark.json" 2>/dev/null || true)
+              [ -n "$name" ] || name=$(basename "$dir")
+              row="| $name |"
+              for i in 1 2 3; do
+                m="$dir/main$i/estimates.json"; o="$dir/ours$i/estimates.json"
+                if [ -f "$m" ] && [ -f "$o" ]; then
+                  row="$row $(jq -rn --slurpfile m "$m" --slurpfile o "$o" '($m[0].median.point_estimate / $o[0].median.point_estimate) * 100 | round / 100') |"
+                else
+                  row="$row - |"
+                fi
+              done
+              echo "$row"
+            done
+          } | tee -a "$GITHUB_STEP_SUMMARY" ratios.md
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: zip-bench-${{ matrix.runner }}-${{ matrix.target }}
+          path: |
+            ratios.md
+            target/criterion
